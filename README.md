@@ -76,7 +76,21 @@ pip install numpy pandas scikit-learn optuna tqdm pillow \
             transformers bitsandbytes accelerate   # last three only for llm.py
 ```
 
-**Data** (all publicly available)
+**Data**
+
+Both datasets are available on Hugging Face: [NeuralSurvivor/FashionIQAndShoe](https://huggingface.co/datasets/NeuralSurvivor/FashionIQAndShoe) (about 828 MB).
+
+```python
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="NeuralSurvivor/FashionIQAndShoe",
+    repo_type="dataset",
+    local_dir="./datasets",
+)
+```
+
+Point the `--folder` argument of the preprocessing scripts at the downloaded Shoes and FashionIQ folders.
 
 - **Shoes**: needs `relative_pairs_test.npy` and the images, resolved relative to the dataset folder you pass in. Each pair is a dict with `source`, `target` and `mod` keys.
 - **FashionIQ**: expects `images/`, `captions/` and `image_splits/` folders in the standard layout.
@@ -169,6 +183,26 @@ Let `i` be the reference-image embedding, `t` the text embedding and `C` the cat
 
 The grid in `result_algo.py` is `alpha ∈ {0.1, 0.25, 0.5, 0.75, 0.9, auto}` × `normalize ∈ {False, True}`. `slerp` runs with `normalize=False` (it normalises internally), and `product`/`min` ignore `alpha`. `auto` runs 100 Optuna trials (step 0.001) minimising the mean target rank on the reference set.
 
+## Tuning process (`alpha="auto"`)
+
+All encoders are frozen, so the only fitted quantity is the image/text weight `alpha`. It is selected on a separate reference dataset (FashionIQ val) and then applied unchanged to Shoes. No Shoes labels are used for tuning.
+
+**Step by step**
+
+1. **Reference set.** `fashionIQ_preprocessing.py` encodes the FashionIQ val split with the same frozen model as Shoes. Each val triplet contributes two queries (one per human caption), and the catalog is the set of val gallery images. These are stored under `data/fashion/<org>/<model>/` and passed to `result_algo.py` as `--ref`.
+2. **Search.** For every (algorithm, normalize) configuration, `find_best_alpha` in `algo.py` creates an [Optuna](https://optuna.org) study and runs **100 trials**. Each trial samples `alpha ∈ [0, 1]` in steps of 0.001 (Optuna's default TPE sampler).
+3. **Objective.** For a trial, the algorithm builds query scores against the reference catalog, and the trial value is the **mean rank of the ground-truth target** over all reference queries (`get_ranks`: rank = 1 + number of gallery items scoring strictly higher than the target). The study **minimises** this value.
+4. **Apply.** The best `alpha` is used to score the Shoes test queries with the same algorithm and `normalize` setting, and the result is written to `results/<org>/<model>/<algo>_auto_<normalize>.json`.
+5. **Record.** The chosen value is stored in the result JSON (`alpha`) and appears as `alpha_used` in `result.csv`, so you can compare the tuned value against the fixed-alpha runs (0.1 to 0.9).
+
+**Details**
+
+- Tuning runs separately for each model, algorithm and `normalize` setting, so every row of `result.csv` has its own `alpha`.
+- Mean rank is used as the objective because it gives a smoother signal than a thresholded recall.
+- `product` and `min` have no `alpha`, so they skip tuning.
+- Trials run sequentially (`n_jobs=1`). The Optuna sampler is not seeded; for exactly reproducible `alpha` values, create the study with `sampler=optuna.samplers.TPESampler(seed=<int>)` in `find_best_alpha`.
+- Finished configurations are detected by their result file and skipped, so an interrupted run can be restarted without repeating tuning.
+
 ## Evaluation
 
 Each query has a single ground-truth target in the catalog; the catalog is the set of unique reference and target images in the test split. `metrics.py` reports, per configuration:
@@ -184,6 +218,10 @@ Because there is exactly one relevant item per query, `mAP` equals `MRR` and `R-
 - The scripts run on a single GPU (`cuda:0`).
 - `metrix_result_llm_caption.py` reads the catalog id order from `data/shoes/Marqo/marqo-fashionCLIP/catalog/img_idx.json`. The catalog order is the same for every model, so run the fashionCLIP Shoes preprocessing first.
 - `fashionIQ_preprocessing.py` uses the official **val** split as the tuning/reference set.
+
+## Demo
+
+A demo notebook is available on Kaggle: [vc-demo](https://www.kaggle.com/code/arvindsharma126/vc-demo).
 
 ## Citation / acknowledgements
 
